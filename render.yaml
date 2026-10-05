@@ -1,0 +1,20 @@
+services:
+  - type: web
+    name: top-score-chat
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn app:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /health
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.8
+      - key: TOPSCORE_DATA_DIR
+        value: /opt/render/project/src/data
+      - key: TOPSCORE_USER
+        sync: false
+      - key: TOPSCORE_PASSWORD
+        sync: false
+    disk:
+      name: topscore-data
+      mountPath: /opt/render/project/src/data
+      sizeGB: 1

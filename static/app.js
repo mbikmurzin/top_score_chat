@@ -36,13 +36,14 @@ $$('.nav-item').forEach(x=>x.onclick=()=>go(x.dataset.page,true));$('.mobile-men
 
 const slots=[
  ['subscribers','Подписчики воронок из SaleBot','Таблицы подписчиков по каждой воронке SaleBot','ссылка'],
+ ['id_map','MAX ID для подписчиков без ID в SaleBot','Постоянный справочник: client ID SaleBot → ID пользователя MAX','файл'],
  ['retail_funnel','Лиды и клиенты с воронок в RetailCRM','Выгрузка из RetailCRM по лидам и клиентам, пришедшим через воронки','файл'],
  ['retail_channel','Лиды и клиенты с MAX-канала в RetailCRM','Выгрузка из RetailCRM по лидам и клиентам, пришедшим из канала MAX','файл'],
  ['channel_subscribers','Подписчики канала MAX','Выгрузка подписчиков и их статусов из канала MAX','файл']
 ];
 async function init(){actionStart('Запуск платформы','Получаем сохранённые данные и подготавливаем интерфейс.');state.boot=await api('/api/bootstrap');renderSources();await loadCampaigns(false);await go(location.hash.slice(1)||'uploads');actionSuccess('Платформа готова','Данные загружены. Можно начинать работу.')}
 function latest(type){return state.boot.history.find(x=>x.source_type===type&&x.active)}
-function renderSources(){$('#source-grid').innerHTML=slots.map(([id,title,text,kind],i)=>{const h=latest(id),marker=h?'✓':String(i+1).padStart(2,'0');return `<article class="card source-card ${h?'source-card--loaded':''}"><div class="source-no ${h?'loaded':''}" title="${h?'Таблица загружена':'Ожидает загрузки'}">${marker}</div><div class="source-copy"><h3>${title}</h3><p>${text}</p>${h?`<small class="source-success">Таблица загружена · обновлено ${new Date(h.created_at).toLocaleString('ru-RU')} · принято ${num(h.accepted_count)}</small>`:'<small>Данные ещё не загружены</small>'}</div><button class="btn ${i===0?'primary':'ghost'} upload-open" data-source="${id}">${kind==='ссылка'?'Добавить':'Загрузить'}</button></article>`}).join('');$$('.upload-open').forEach(x=>x.onclick=()=>openUpload(x.dataset.source))}
+function renderSources(){const visibleSlots=slots.filter(([id])=>id!=='id_map'||!state.boot.backend_sources?.id_map?.ready);$('#source-grid').innerHTML=visibleSlots.map(([id,title,text,kind],i)=>{const h=latest(id),marker=h?'✓':String(i+1).padStart(2,'0');return `<article class="card source-card ${h?'source-card--loaded':''}"><div class="source-no ${h?'loaded':''}" title="${h?'Таблица загружена':'Ожидает загрузки'}">${marker}</div><div class="source-copy"><h3>${title}</h3><p>${text}</p>${h?`<small class="source-success">Таблица загружена · обновлено ${new Date(h.created_at).toLocaleString('ru-RU')} · принято ${num(h.accepted_count)}</small>`:'<small>Данные ещё не загружены</small>'}</div><button class="btn ${i===0?'primary':'ghost'} upload-open" data-source="${id}">${kind==='ссылка'?'Добавить':'Загрузить'}</button></article>`}).join('');$$('.upload-open').forEach(x=>x.onclick=()=>openUpload(x.dataset.source))}
 function openUpload(source){
  state.source=source;state.file=null;
  const isSub=source==='subscribers',funnels=state.boot.funnels.filter(f=>f.active);

@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import csv
+import base64
 import hashlib
 import io
 import json
 import os
 import re
+import secrets
 import shutil
 import sqlite3
 import uuid
@@ -17,13 +19,13 @@ from pathlib import Path
 from typing import Any
 
 import pandas as pd
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
+from fastapi.responses import FileResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 ROOT = Path(__file__).resolve().parent
-DATA = ROOT / "data"
+DATA = Path(os.environ.get("TOPSCORE_DATA_DIR", str(ROOT / "data"))).expanduser().resolve()
 UPLOADS = DATA / "uploads"
 DRAFTS = DATA / "drafts"
 DB_PATH = DATA / "topscore.db"
@@ -719,6 +721,40 @@ migrate_latest_subscriber_snapshots()
 migrate_topscore_formula_v2()
 app = FastAPI(title="TopScore чатов", version="1.0.0")
 app.mount("/static", StaticFiles(directory=ROOT / "static"), name="static")
+
+
+@app.middleware("http")
+async def password_protection(request: Request, call_next):
+    """Protect a shared deployment while keeping local development unchanged."""
+    username = os.environ.get("TOPSCORE_USER", "").strip()
+    password = os.environ.get("TOPSCORE_PASSWORD", "")
+    if request.url.path == "/health" or not (username and password):
+        return await call_next(request)
+
+    authorization = request.headers.get("Authorization", "")
+    valid = False
+    if authorization.startswith("Basic "):
+        try:
+            decoded = base64.b64decode(authorization[6:], validate=True).decode("utf-8")
+            supplied_user, supplied_password = decoded.split(":", 1)
+            valid = secrets.compare_digest(supplied_user, username) and secrets.compare_digest(
+                supplied_password, password
+            )
+        except (ValueError, UnicodeDecodeError):
+            valid = False
+    if not valid:
+        return Response(
+            "Требуются логин и пароль",
+            status_code=401,
+            media_type="text/plain; charset=utf-8",
+            headers={"WWW-Authenticate": 'Basic realm="TopScore"'},
+        )
+    return await call_next(request)
+
+
+@app.get("/health")
+def health():
+    return {"status": "ok"}
 
 
 @app.get("/")
