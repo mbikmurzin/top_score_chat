@@ -12,6 +12,7 @@ import shutil
 import sqlite3
 import uuid
 import urllib.request
+from collections.abc import Mapping
 from contextlib import contextmanager
 from datetime import datetime
 from decimal import Decimal, InvalidOperation
@@ -76,7 +77,79 @@ REQUIRED = {
 }
 
 
+class DatabaseRow(Mapping):
+    """A sqlite3.Row-compatible mapping for the remote libSQL driver."""
+
+    def __init__(self, columns, values):
+        self._columns = tuple(columns)
+        self._values = tuple(values)
+        self._by_name = dict(zip(self._columns, self._values))
+
+    def __getitem__(self, key):
+        if isinstance(key, int):
+            return self._values[key]
+        return self._by_name[key]
+
+    def __iter__(self):
+        return iter(self._columns)
+
+    def __len__(self):
+        return len(self._columns)
+
+
+class DatabaseCursor:
+    def __init__(self, cursor):
+        self._cursor = cursor
+
+    def _convert(self, row):
+        if row is None or isinstance(row, sqlite3.Row):
+            return row
+        columns = [column[0] for column in (self._cursor.description or ())]
+        return DatabaseRow(columns, row)
+
+    def fetchone(self):
+        return self._convert(self._cursor.fetchone())
+
+    def fetchall(self):
+        return [self._convert(row) for row in self._cursor.fetchall()]
+
+    def __iter__(self):
+        while True:
+            row = self.fetchone()
+            if row is None:
+                return
+            yield row
+
+    def __getattr__(self, name):
+        return getattr(self._cursor, name)
+
+
+class DatabaseConnection:
+    def __init__(self, connection):
+        self._connection = connection
+
+    def execute(self, sql, parameters=()):
+        return DatabaseCursor(self._connection.execute(sql, parameters))
+
+    def executemany(self, sql, parameters):
+        return DatabaseCursor(self._connection.executemany(sql, parameters))
+
+    def executescript(self, script):
+        return self._connection.executescript(script)
+
+    def __getattr__(self, name):
+        return getattr(self._connection, name)
+
+
 def connect():
+    turso_url = os.environ.get("TURSO_DATABASE_URL", "").strip()
+    turso_token = os.environ.get("TURSO_AUTH_TOKEN", "").strip()
+    if turso_url:
+        import libsql
+
+        conn = libsql.connect(turso_url, auth_token=turso_token)
+        conn.execute("PRAGMA foreign_keys=ON")
+        return DatabaseConnection(conn)
     conn = sqlite3.connect(DB_PATH, timeout=30)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys=ON")
