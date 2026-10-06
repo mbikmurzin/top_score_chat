@@ -16,6 +16,7 @@ from collections.abc import Mapping
 from contextlib import contextmanager
 from datetime import datetime
 from decimal import Decimal, InvalidOperation
+from itertools import islice
 from pathlib import Path
 from typing import Any
 
@@ -132,7 +133,13 @@ class DatabaseConnection:
         return DatabaseCursor(self._connection.execute(sql, parameters))
 
     def executemany(self, sql, parameters):
-        return DatabaseCursor(self._connection.executemany(sql, parameters))
+        # Remote libSQL requests have practical payload limits. Sending large
+        # imports in bounded batches also avoids one HTTP request per row.
+        iterator = iter(parameters)
+        last_cursor = None
+        while batch := list(islice(iterator, 500)):
+            last_cursor = self._connection.executemany(sql, batch)
+        return DatabaseCursor(last_cursor) if last_cursor is not None else None
 
     def executescript(self, script):
         return self._connection.executescript(script)
@@ -463,6 +470,7 @@ def rebuild_facts(conn):
         return
     placeholders = ",".join("?" for _ in active_subscriber_ids)
     subs = conn.execute(f"SELECT s.* FROM subscriber_records s WHERE s.upload_id IN ({placeholders}) ORDER BY subscription_at,id", active_subscriber_ids)
+    fact_rows = []
     for s in subs:
         cohort = s["subscription_at"][:7]
         academic_year = academic_year_key(s["subscription_at"])
@@ -492,10 +500,14 @@ def rebuild_facts(conn):
         for c in campaign_rows:
             if c["month"] == cohort and c["funnel_id"] == s["funnel_id"] and (c["campaign_id"] == utm or (c["campaign_id"] and c["campaign_id"] in utm)):
                 campaign_id = c["campaign_id"]; break
-        conn.execute("""INSERT INTO facts(funnel_id,client_id,max_id,full_name,subscription_at,cohort_month,utm_source,utm_medium,utm_campaign,utm_content,utm_term,tag,campaign_id,ever_channel,active_channel,funnel_lead,funnel_lead_at,funnel_paid,funnel_paid_at,funnel_revenue,channel_lead,channel_lead_at,channel_paid,channel_paid_at,channel_revenue,source_batch_id) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""", (
+        fact_rows.append((
             s["funnel_id"],s["client_id"],max_id,s["full_name"],s["subscription_at"],cohort,s["utm_source"],s["utm_medium"],s["utm_campaign"],s["utm_content"],s["utm_term"],s["tag"],campaign_id,bool(member_rows) or s["client_id"] in historical_channel_clients,active,
             values["funnel"]["lead"],values["funnel"]["lead_at"],values["funnel"]["paid"],values["funnel"]["paid_at"],str(values["funnel"]["revenue"]),values["channel"]["lead"],values["channel"]["lead_at"],values["channel"]["paid"],values["channel"]["paid_at"],str(values["channel"]["revenue"]),s["upload_id"]
         ))
+    conn.executemany(
+        """INSERT INTO facts(funnel_id,client_id,max_id,full_name,subscription_at,cohort_month,utm_source,utm_medium,utm_campaign,utm_content,utm_term,tag,campaign_id,ever_channel,active_channel,funnel_lead,funnel_lead_at,funnel_paid,funnel_paid_at,funnel_revenue,channel_lead,channel_lead_at,channel_paid,channel_paid_at,channel_revenue,source_batch_id) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+        fact_rows,
+    )
 
 
 def historical_facts(conn, as_of):
@@ -914,7 +926,7 @@ def inspect_link(body: LinkUpload):
             "User-Agent": "Mozilla/5.0 TopScore/1.0",
             "Accept": "text/csv,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,*/*",
         })
-        with urllib.request.urlopen(request, timeout=30) as response:
+        with urllib.request.urlopen(request, timeout=90) as response:
             content = response.read(50 * 1024 * 1024 + 1)
             content_type = response.headers.get("content-type", "")
     except Exception as exc:
@@ -966,20 +978,31 @@ def confirm_upload(body: ConfirmUpload):
     with db() as conn:
         old = conn.execute("SELECT * FROM uploads WHERE source_type=? AND file_hash=? AND sheet_name=?", (source, effective_hash, meta["sheet"])).fetchone()
         if old:
+            changed = False
             if source == "subscribers" and body.mapping.get("max_id") in frame.columns:
                 max_column = body.mapping["max_id"]
+                existing_max_ids = {
+                    row["row_number"]: clean_id(row["max_id"])
+                    for row in conn.execute(
+                        "SELECT row_number,max_id FROM subscriber_records WHERE upload_id=?",
+                        (old["id"],),
+                    )
+                }
                 updates = [
                     (mid, old["id"], idx + 2)
                     for idx, row in frame.iterrows()
-                    if (mid := clean_id(row.get(max_column)))
+                    if (mid := clean_id(row.get(max_column))) and not existing_max_ids.get(idx + 2)
                 ]
-                conn.executemany(
-                    "UPDATE subscriber_records SET max_id=? WHERE upload_id=? AND row_number=? AND (max_id IS NULL OR TRIM(max_id)='')",
-                    updates,
-                )
+                if updates:
+                    conn.executemany(
+                        "UPDATE subscriber_records SET max_id=? WHERE upload_id=? AND row_number=? AND (max_id IS NULL OR TRIM(max_id)='')",
+                        updates,
+                    )
+                    changed = True
             if not old["active"]:
                 conn.execute("UPDATE uploads SET active=1 WHERE id=?", (old["id"],))
-            if source == "subscribers":
+                changed = True
+            if source == "subscribers" and changed:
                 rebuild_facts(conn)
             return {"id": old["id"], "duplicate_file": True, "quality": json.loads(old["quality_json"])}
         upload_id = uuid.uuid4().hex
