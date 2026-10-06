@@ -3,6 +3,7 @@ from __future__ import annotations
 import csv
 import base64
 import hashlib
+import hmac
 import io
 import json
 import os
@@ -22,7 +23,7 @@ from typing import Any
 
 import pandas as pd
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
-from fastapi.responses import FileResponse, Response, StreamingResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
@@ -808,17 +809,28 @@ app = FastAPI(title="TopScore чатов", version="1.0.0")
 app.mount("/static", StaticFiles(directory=ROOT / "static"), name="static")
 
 
+def browser_session_token(username: str, password: str) -> str:
+    return hmac.new(password.encode("utf-8"), username.encode("utf-8"), hashlib.sha256).hexdigest()
+
+
+def login_page(error: str = "") -> HTMLResponse:
+    message = '<p class="error">Неверный логин или пароль</p>' if error else ""
+    return HTMLResponse(f"""<!doctype html><html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Вход — TopScore</title><style>
+    *{{box-sizing:border-box}}body{{margin:0;min-height:100vh;display:grid;place-items:center;background:#f3f6fb;color:#10203b;font:16px Arial,sans-serif}}form{{width:min(420px,calc(100% - 32px));padding:34px;background:#fff;border-radius:18px;box-shadow:0 16px 50px #1b2d4a1f}}h1{{margin:0 0 8px}}p{{color:#73809a}}label{{display:block;margin-top:18px;font-size:13px;font-weight:700}}input{{width:100%;margin-top:7px;padding:13px;border:1px solid #d8dfeb;border-radius:10px;font-size:16px}}button{{width:100%;margin-top:24px;padding:14px;border:0;border-radius:10px;background:#6c57e9;color:#fff;font-weight:700;font-size:16px;cursor:pointer}}.error{{color:#c83232;background:#fff0f0;padding:10px;border-radius:8px}}</style></head><body><form method="post" action="/login"><h1>TopScore</h1><p>Войдите для работы с платформой</p>{message}<label>Логин<input name="username" autocomplete="username" required autofocus></label><label>Пароль<input name="password" type="password" autocomplete="current-password" required></label><button type="submit">Войти</button></form></body></html>""")
+
+
 @app.middleware("http")
 async def password_protection(request: Request, call_next):
-    """Protect a shared deployment while keeping local development unchanged."""
+    """Protect a shared deployment with a browser-friendly login page."""
     username = os.environ.get("TOPSCORE_USER", "").strip()
     password = os.environ.get("TOPSCORE_PASSWORD", "")
-    if request.url.path == "/health" or not (username and password):
+    if request.url.path in {"/health", "/login"} or not (username and password):
         return await call_next(request)
 
+    expected_session = browser_session_token(username, password)
+    valid = secrets.compare_digest(request.cookies.get("topscore_session", ""), expected_session)
     authorization = request.headers.get("Authorization", "")
-    valid = False
-    if authorization.startswith("Basic "):
+    if not valid and authorization.startswith("Basic "):
         try:
             decoded = base64.b64decode(authorization[6:], validate=True).decode("utf-8")
             supplied_user, supplied_password = decoded.split(":", 1)
@@ -828,18 +840,43 @@ async def password_protection(request: Request, call_next):
         except (ValueError, UnicodeDecodeError):
             valid = False
     if not valid:
-        return Response(
-            "Требуются логин и пароль",
-            status_code=401,
-            media_type="text/plain; charset=utf-8",
-            headers={"WWW-Authenticate": 'Basic realm="TopScore"'},
-        )
+        if request.url.path.startswith("/api/"):
+            return JSONResponse({"detail": "Требуется повторный вход"}, status_code=401)
+        return RedirectResponse("/login", status_code=303)
     return await call_next(request)
 
 
 @app.get("/health")
 def health():
     return {"status": "ok"}
+
+
+@app.get("/login")
+def login_form():
+    return login_page()
+
+
+@app.post("/login")
+def login(username: str = Form(...), password: str = Form(...)):
+    expected_user = os.environ.get("TOPSCORE_USER", "").strip()
+    expected_password = os.environ.get("TOPSCORE_PASSWORD", "")
+    if not expected_user or not expected_password:
+        return RedirectResponse("/", status_code=303)
+    if not (
+        secrets.compare_digest(username, expected_user)
+        and secrets.compare_digest(password, expected_password)
+    ):
+        return login_page("invalid")
+    response = RedirectResponse("/", status_code=303)
+    response.set_cookie(
+        "topscore_session",
+        browser_session_token(expected_user, expected_password),
+        max_age=30 * 24 * 60 * 60,
+        httponly=True,
+        secure=True,
+        samesite="lax",
+    )
+    return response
 
 
 @app.get("/")
@@ -944,6 +981,7 @@ class ConfirmUpload(BaseModel):
     token: str
     mapping: dict[str, str]
     funnel_id: str | None = None
+    defer_rebuild: bool = False
 
 
 @app.post("/api/uploads/confirm")
@@ -1002,9 +1040,10 @@ def confirm_upload(body: ConfirmUpload):
             if not old["active"]:
                 conn.execute("UPDATE uploads SET active=1 WHERE id=?", (old["id"],))
                 changed = True
-            if source == "subscribers" and changed:
+            rebuild_required = source == "subscribers" and changed
+            if rebuild_required and not body.defer_rebuild:
                 rebuild_facts(conn)
-            return {"id": old["id"], "duplicate_file": True, "quality": json.loads(old["quality_json"])}
+            return {"id": old["id"], "duplicate_file": True, "quality": json.loads(old["quality_json"]), "rebuild_required": rebuild_required and body.defer_rebuild}
         upload_id = uuid.uuid4().hex
         quality = {"read": len(frame), "accepted": 0, "duplicates": 0, "errors": 0, "missing_client_id": 0, "missing_max_id": 0, "invalid_dates": 0, "without_utm": 0, "id_conflicts": 0}
         seen = {} if source == "id_map" else set()
@@ -1072,9 +1111,17 @@ def confirm_upload(body: ConfirmUpload):
         elif source in {"id_map","bs_funnel","bs_channel","retail_funnel","retail_channel","channel_subscribers","campaigns"}:
             conn.execute("UPDATE uploads SET active=0 WHERE source_type=? AND id<>?", (source, upload_id))
         conn.execute("INSERT OR REPLACE INTO mappings(source_type,signature,mapping_json,created_at) VALUES(?,?,?,?)",(source,meta["signature"],json.dumps(effective_mapping,ensure_ascii=False),MOSCOW_NOW()))
-        rebuild_facts(conn)
+        if not body.defer_rebuild:
+            rebuild_facts(conn)
     draft.unlink(missing_ok=True)
-    return {"id":upload_id,"duplicate_file":False,"quality":quality}
+    return {"id":upload_id,"duplicate_file":False,"quality":quality,"rebuild_required":body.defer_rebuild}
+
+
+@app.post("/api/rebuild")
+def rebuild_all_facts():
+    with db() as conn:
+        rebuild_facts(conn)
+    return {"ok": True}
 
 
 def safe_div(a, b): return float(a / b) if a is not None and b else None
