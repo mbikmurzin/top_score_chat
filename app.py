@@ -1048,17 +1048,18 @@ def confirm_upload(body: ConfirmUpload):
             changed = False
             if source == "subscribers" and body.mapping.get("max_id") in frame.columns:
                 max_column = body.mapping["max_id"]
-                existing_max_ids = {
-                    row["row_number"]: clean_id(row["max_id"])
+                missing_max_id_rows = {
+                    row["row_number"]
                     for row in conn.execute(
-                        "SELECT row_number,max_id FROM subscriber_records WHERE upload_id=?",
+                        """SELECT row_number FROM subscriber_records
+                           WHERE upload_id=? AND (max_id IS NULL OR TRIM(max_id)='')""",
                         (old["id"],),
                     )
                 }
                 updates = [
                     (mid, old["id"], idx + 2)
                     for idx, row in frame.iterrows()
-                    if (mid := clean_id(row.get(max_column))) and not existing_max_ids.get(idx + 2)
+                    if (mid := clean_id(row.get(max_column))) and idx + 2 in missing_max_id_rows
                 ]
                 if updates:
                     conn.executemany(

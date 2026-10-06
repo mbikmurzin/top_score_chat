@@ -65,7 +65,7 @@ function openUpload(source){
 
 async function importSubscriberLinks(){
  const entries=$$('.funnel-link').filter(x=>x.value.trim());
- const button=$('#import-links');let loaded=0,failed=0,rebuildRequired=false;
+ const button=$('#import-links');let loaded=0,failed=0,rebuildRequired=false,lastError='';
  actionStart('Загрузка таблиц SaleBot',`Подготовлено таблиц: ${entries.length}. Начинаем получение данных.`);
  button.disabled=true;button.textContent=`Загрузка: 0 из ${entries.length}`;
  for(let i=0;i<entries.length;i++){
@@ -73,20 +73,23 @@ async function importSubscriberLinks(){
   const funnelName=$('span',input.closest('.funnel-link-row')).textContent;
   actionProgress('Загрузка таблиц SaleBot',`Обрабатывается ${i+1} из ${entries.length}: ${funnelName}\nУже загружено: ${loaded}. Ошибок: ${failed}.`);
   input.disabled=true;status.className='link-status loading';status.textContent='Получение данных…';
-  try{
-   const draft=await api('/api/uploads/inspect-link',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({source_type:'subscribers',url:input.value.trim()})});
-   const missing=draft.required.filter(field=>!draft.mapping[field]);
-   if(missing.length)throw Error(`Не найдены столбцы: ${missing.join(', ')}`);
-   const result=await api('/api/uploads/confirm',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({token:draft.token,mapping:draft.mapping,funnel_id:input.dataset.funnel,defer_rebuild:true})});
-   rebuildRequired=rebuildRequired||result.rebuild_required;
-   loaded++;status.className='link-status success';status.textContent=result.duplicate_file?'Уже загружено ранее':`Загружено строк: ${num(result.quality.accepted)}`;
-  }catch(e){failed++;status.className='link-status error';status.textContent=e.message}
+  let result=null,error=null;
+  for(let attempt=1;attempt<=3&&!result;attempt++){
+   try{
+    const draft=await api('/api/uploads/inspect-link',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({source_type:'subscribers',url:input.value.trim()})});
+    const missing=draft.required.filter(field=>!draft.mapping[field]);
+    if(missing.length)throw Error(`Не найдены столбцы: ${missing.join(', ')}`);
+    result=await api('/api/uploads/confirm',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({token:draft.token,mapping:draft.mapping,funnel_id:input.dataset.funnel,defer_rebuild:true})});
+   }catch(e){error=e;if(attempt<3){lastError=`${funnelName}: ${e.message}`;actionProgress('Повторная попытка',`Не удалось загрузить «${funnelName}». Попытка ${attempt+1} из 3.\n${e.message}`);await new Promise(resolve=>setTimeout(resolve,attempt*3000))}}
+  }
+  if(result){rebuildRequired=rebuildRequired||result.rebuild_required;loaded++;status.className='link-status success';status.textContent=result.duplicate_file?'Уже загружено ранее':`Загружено строк: ${num(result.quality.accepted)}`}
+  else{failed++;lastError=`${funnelName}: ${error?.message||'Неизвестная ошибка'}`;status.className='link-status error';status.textContent=error?.message||'Неизвестная ошибка'}
   input.disabled=false;button.textContent=`Загрузка: ${i+1} из ${entries.length}`;
  }
  if(rebuildRequired){actionProgress('Пересчёт показателей','Все таблицы сохранены. Сравниваем новые данные с текущей статистикой и записываем только изменения.');const rebuildController=new AbortController();const rebuildTimeout=setTimeout(()=>rebuildController.abort(),10*60*1000);try{await api('/api/rebuild',{method:'POST',signal:rebuildController.signal})}catch(e){if(e.name==='AbortError')throw Error('Пересчёт превысил 10 минут и был остановлен. Обновите страницу и повторите попытку.');throw e}finally{clearTimeout(rebuildTimeout)}}
  state.boot=await api('/api/bootstrap');renderSources();
  button.disabled=false;button.textContent='Загрузить все таблицы SaleBot';
- if(failed)actionError('Загрузка завершена с ошибками',`Успешно загружено: ${loaded}. Ошибок: ${failed}. Подробности указаны напротив каждой воронки.`);else actionSuccess('Все таблицы загружены',`Обработано таблиц: ${loaded}. Итоговые показатели пересчитаны.`);
+ if(failed)actionError('Загрузка завершена с ошибками',`Успешно загружено: ${loaded}. Ошибок: ${failed}.\nПоследняя ошибка: ${lastError}`);else actionSuccess('Все таблицы загружены',`Обработано таблиц: ${loaded}. Итоговые показатели пересчитаны.`);
 }
 
 async function inspectFile(){actionStart('Чтение файла',`Проверяем структуру файла «${state.file?.name||''}» и определяем столбцы.`);try{const fd=new FormData();fd.append('source_type',state.source);fd.append('file',state.file);state.draft=await api('/api/uploads/inspect',{method:'POST',body:fd});renderMapping();actionSuccess('Файл прочитан',`Найдено строк: ${num(state.draft.rows)}. Проверьте сопоставление столбцов ниже.`)}catch(e){actionError('Не удалось прочитать файл',e)}}
