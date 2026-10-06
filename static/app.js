@@ -83,7 +83,7 @@ async function importSubscriberLinks(){
   }catch(e){failed++;status.className='link-status error';status.textContent=e.message}
   input.disabled=false;button.textContent=`Загрузка: ${i+1} из ${entries.length}`;
  }
- if(rebuildRequired){actionProgress('Пересчёт показателей','Все таблицы сохранены. Выполняется один итоговый пересчёт статистики.');await api('/api/rebuild',{method:'POST'})}
+ if(rebuildRequired){actionProgress('Пересчёт показателей','Все таблицы сохранены. Сравниваем новые данные с текущей статистикой и записываем только изменения.');const rebuildController=new AbortController();const rebuildTimeout=setTimeout(()=>rebuildController.abort(),10*60*1000);try{await api('/api/rebuild',{method:'POST',signal:rebuildController.signal})}catch(e){if(e.name==='AbortError')throw Error('Пересчёт превысил 10 минут и был остановлен. Обновите страницу и повторите попытку.');throw e}finally{clearTimeout(rebuildTimeout)}}
  state.boot=await api('/api/bootstrap');renderSources();
  button.disabled=false;button.textContent='Загрузить все таблицы SaleBot';
  if(failed)actionError('Загрузка завершена с ошибками',`Успешно загружено: ${loaded}. Ошибок: ${failed}. Подробности указаны напротив каждой воронки.`);else actionSuccess('Все таблицы загружены',`Обработано таблиц: ${loaded}. Итоговые показатели пересчитаны.`);

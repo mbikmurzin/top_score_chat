@@ -435,7 +435,17 @@ def academic_year_key(value: str) -> str | None:
 
 
 def rebuild_facts(conn):
-    conn.execute("DELETE FROM facts")
+    fact_columns = (
+        "funnel_id", "client_id", "max_id", "full_name", "subscription_at", "cohort_month",
+        "utm_source", "utm_medium", "utm_campaign", "utm_content", "utm_term", "tag",
+        "campaign_id", "ever_channel", "active_channel", "funnel_lead", "funnel_lead_at",
+        "funnel_paid", "funnel_paid_at", "funnel_revenue", "channel_lead", "channel_lead_at",
+        "channel_paid", "channel_paid_at", "channel_revenue", "source_batch_id",
+    )
+    existing_facts = {}
+    for row in conn.execute(f"SELECT {','.join(fact_columns)} FROM facts"):
+        values = tuple(row[column] for column in fact_columns)
+        existing_facts[(row["funnel_id"], row["client_id"], row["cohort_month"])] = values
     maps = {}
     conflicts = set()
     id_map_upload = latest_active_upload(conn, "id_map")
@@ -468,7 +478,10 @@ def rebuild_facts(conn):
         latest_subscriber_uploads[row["funnel_id"]] = row["upload_id"]
     active_subscriber_ids = list(latest_subscriber_uploads.values())
     if not active_subscriber_ids:
-        return
+        removed = len(existing_facts)
+        if removed:
+            conn.execute("DELETE FROM facts")
+        return {"total": 0, "updated": 0, "removed": removed}
     placeholders = ",".join("?" for _ in active_subscriber_ids)
     subs = conn.execute(f"SELECT s.* FROM subscriber_records s WHERE s.upload_id IN ({placeholders}) ORDER BY subscription_at,id", active_subscriber_ids)
     fact_rows = []
@@ -505,10 +518,26 @@ def rebuild_facts(conn):
             s["funnel_id"],s["client_id"],max_id,s["full_name"],s["subscription_at"],cohort,s["utm_source"],s["utm_medium"],s["utm_campaign"],s["utm_content"],s["utm_term"],s["tag"],campaign_id,bool(member_rows) or s["client_id"] in historical_channel_clients,active,
             values["funnel"]["lead"],values["funnel"]["lead_at"],values["funnel"]["paid"],values["funnel"]["paid_at"],str(values["funnel"]["revenue"]),values["channel"]["lead"],values["channel"]["lead_at"],values["channel"]["paid"],values["channel"]["paid_at"],str(values["channel"]["revenue"]),s["upload_id"]
         ))
-    conn.executemany(
-        """INSERT INTO facts(funnel_id,client_id,max_id,full_name,subscription_at,cohort_month,utm_source,utm_medium,utm_campaign,utm_content,utm_term,tag,campaign_id,ever_channel,active_channel,funnel_lead,funnel_lead_at,funnel_paid,funnel_paid_at,funnel_revenue,channel_lead,channel_lead_at,channel_paid,channel_paid_at,channel_revenue,source_batch_id) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-        fact_rows,
-    )
+    desired_facts = {}
+    for row in fact_rows:
+        key = (row[0], row[1], row[5])
+        existing = existing_facts.get(key)
+        # A new source snapshot ID alone does not change any KPI. Keep the
+        # previous provenance value when all business fields are identical.
+        desired_facts[key] = existing if existing and existing[:-1] == row[:-1] else row
+    changed_rows = [row for key, row in desired_facts.items() if existing_facts.get(key) != row]
+    removed_keys = [key for key in existing_facts if key not in desired_facts]
+    if changed_rows:
+        conn.executemany(
+            f"INSERT OR REPLACE INTO facts({','.join(fact_columns)}) VALUES({','.join('?' for _ in fact_columns)})",
+            changed_rows,
+        )
+    if removed_keys:
+        conn.executemany(
+            "DELETE FROM facts WHERE funnel_id=? AND client_id=? AND cohort_month=?",
+            removed_keys,
+        )
+    return {"total": len(fact_rows), "updated": len(changed_rows), "removed": len(removed_keys)}
 
 
 def historical_facts(conn, as_of):
@@ -1120,8 +1149,8 @@ def confirm_upload(body: ConfirmUpload):
 @app.post("/api/rebuild")
 def rebuild_all_facts():
     with db() as conn:
-        rebuild_facts(conn)
-    return {"ok": True}
+        result = rebuild_facts(conn)
+    return {"ok": True, **(result or {})}
 
 
 def safe_div(a, b): return float(a / b) if a is not None and b else None
